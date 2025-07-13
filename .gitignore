@@ -1,6 +1,8 @@
 *.*.sw*
 build
 dev
+*.exe
+*.obj
 
 /.vscode
 /.git

@@ -5,6 +5,15 @@
 #include <windows.h>
 #include "ascii_chars.h"
 
+// For cursor positioning and selective redraw
+static char previous_time_str[9] = {0};
+static int first_run = 1;
+
+// Double buffering screen handles
+static HANDLE hScreen1, hScreen2;
+static HANDLE hCurrentScreen;
+static int current_buffer = 0;
+
 #define MAX_LINES 30
 #define MAX_COLS 20
 #define NUM_DIGITS 10
@@ -128,6 +137,104 @@ void print_centered(const char* text, int console_width) {
     printf("%s\n", text);
 }
 
+// Function to initialize double buffering
+int init_double_buffer() {
+    // Create two screen buffers
+    hScreen1 = CreateConsoleScreenBuffer(
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        CONSOLE_TEXTMODE_BUFFER,
+        NULL
+    );
+    
+    hScreen2 = CreateConsoleScreenBuffer(
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        CONSOLE_TEXTMODE_BUFFER,
+        NULL
+    );
+    
+    if (hScreen1 == INVALID_HANDLE_VALUE || hScreen2 == INVALID_HANDLE_VALUE) {
+        return 0; // Failed to create buffers
+    }
+    
+    // Start with screen1 as active
+    hCurrentScreen = hScreen1;
+    SetConsoleActiveScreenBuffer(hCurrentScreen);
+    
+    return 1; // Success
+}
+
+// Function to swap screen buffers
+void swap_buffers() {
+    current_buffer = 1 - current_buffer;
+    hCurrentScreen = (current_buffer == 0) ? hScreen1 : hScreen2;
+    SetConsoleActiveScreenBuffer(hCurrentScreen);
+}
+
+// Function to clear entire screen buffer without flashing
+void clear_screen_buffer(HANDLE hBuffer) {
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    COORD coord = {0, 0};
+    DWORD written;
+    
+    if (GetConsoleScreenBufferInfo(hBuffer, &csbi)) {
+        DWORD bufferSize = csbi.dwSize.X * csbi.dwSize.Y;
+        FillConsoleOutputCharacter(hBuffer, ' ', bufferSize, coord, &written);
+        FillConsoleOutputAttribute(hBuffer, csbi.wAttributes, bufferSize, coord, &written);
+        SetConsoleCursorPosition(hBuffer, coord);
+    }
+}
+
+// Function to clear a specific area of the screen buffer
+void clear_area(HANDLE hBuffer, int start_line, int num_lines, int console_width) {
+    COORD coord;
+    DWORD written;
+    
+    for (int i = 0; i < num_lines; i++) {
+        coord.X = 0;
+        coord.Y = start_line + i;
+        SetConsoleCursorPosition(hBuffer, coord);
+        FillConsoleOutputCharacter(hBuffer, ' ', console_width, coord, &written);
+    }
+}
+
+// Function to position cursor on specific buffer
+void set_cursor_position(HANDLE hBuffer, int x, int y) {
+    COORD coord = {x, y};
+    SetConsoleCursorPosition(hBuffer, coord);
+}
+
+// Function to hide/show cursor on specific buffer
+void set_cursor_visibility(HANDLE hBuffer, int visible) {
+    CONSOLE_CURSOR_INFO cursorInfo;
+    GetConsoleCursorInfo(hBuffer, &cursorInfo);
+    cursorInfo.bVisible = visible;
+    SetConsoleCursorInfo(hBuffer, &cursorInfo);
+}
+
+// Function to write text to specific buffer at current position
+void write_to_buffer(HANDLE hBuffer, const char* text) {
+    DWORD written;
+    WriteConsole(hBuffer, text, strlen(text), &written, NULL);
+}
+
+// Function to write centered text to buffer
+void write_centered_to_buffer(HANDLE hBuffer, const char* text, int console_width) {
+    int text_len = strlen(text);
+    int padding = (console_width - text_len) / 2;
+    
+    if (padding > 0) {
+        for (int i = 0; i < padding; i++) {
+            write_to_buffer(hBuffer, " ");
+        }
+    }
+    write_to_buffer(hBuffer, text);
+    write_to_buffer(hBuffer, "\n");
+}
+
 // Function to display the time
 void display_time() {
     time_t rawtime;
@@ -139,6 +246,20 @@ void display_time() {
     // Format time as HH:MM:SS
     char time_str[9];
     sprintf(time_str, "%02d:%02d:%02d", timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+    
+    // Check if time has changed (skip redraw if same)
+    if (!first_run && strcmp(time_str, previous_time_str) == 0) {
+        return;
+    }
+    
+    // Get the inactive buffer for drawing
+    HANDLE hBackBuffer = (current_buffer == 0) ? hScreen2 : hScreen1;
+    
+    // Clear the back buffer completely
+    clear_screen_buffer(hBackBuffer);
+    
+    // Hide cursor on back buffer
+    set_cursor_visibility(hBackBuffer, 0);
     
     // Get character indices for display
     int char_indices[8];
@@ -155,42 +276,62 @@ void display_time() {
     int max_height, max_width;
     get_max_dimensions(&max_height, &max_width);
     
+    // Use consistent width for all characters to prevent shifting
+    int uniform_width = max_width;
+    
     // Get console dimensions
     int console_width, console_height;
     get_console_size(&console_width, &console_height);
     
-    // Calculate total width of the clock display
-    int total_clock_width = (max_width * 8) + 7 + 4; // 8 chars, 7 normal spaces, 4 extra spaces for colons
+    // Calculate total width of the clock display using uniform width
+    int total_clock_width = (uniform_width * 8) + 7 + 4; // 8 chars, 7 normal spaces, 4 extra spaces for colons
     int clock_padding = (console_width - total_clock_width) / 2;
     if (clock_padding < 0) clock_padding = 0;
-    
-    // Clear screen
-    system("cls");
     
     // Display date at the top
     char date_str[MAX_DATE_LENGTH];
     get_date_string(date_str, sizeof(date_str));
-    printf("\n");
-    print_centered(date_str, console_width);
-    printf("\n\n");
+    
+    // Position cursor and write date
+    set_cursor_position(hBackBuffer, 0, 1);
+    write_centered_to_buffer(hBackBuffer, date_str, console_width);
+    
+    // Calculate where the clock starts (line 4 after title and spacing)
+    int clock_start_line = 4;
     
     // Display each line of the ASCII art (centered)
     for (int line = 0; line < max_height; line++) {
-        // Print padding to center the clock
+        // Position cursor at the start of this line
+        set_cursor_position(hBackBuffer, 0, clock_start_line + line);
+        
+        // Create line content in memory first
+        char line_content[512] = {0}; // Buffer for the entire line
+        int pos = 0;
+        
+        // Add padding to center the clock
         for (int i = 0; i < clock_padding; i++) {
-            printf(" ");
+            line_content[pos++] = ' ';
         }
         
         for (int char_pos = 0; char_pos < TIME_CHARS; char_pos++) {
             int char_idx = char_indices[char_pos];
             
-            // Print the character line
+            // Add the character line with uniform width
             if (line < ascii_chars[char_idx].height) {
-                printf("%s", ascii_chars[char_idx].lines[line]);
+                // Add the character content
+                const char* char_line = ascii_chars[char_idx].lines[line];
+                int char_actual_width = strlen(char_line);
+                strcpy(line_content + pos, char_line);
+                pos += char_actual_width;
+                
+                // Pad to uniform width
+                for (int i = char_actual_width; i < uniform_width; i++) {
+                    line_content[pos++] = ' ';
+                }
             } else {
-                // Print spaces if this character doesn't have this many lines
-                for (int i = 0; i < max_width; i++) {
-                    printf(" ");
+                // Add spaces for uniform width if this character doesn't have this many lines
+                for (int i = 0; i < uniform_width; i++) {
+                    line_content[pos++] = ' ';
                 }
             }
             
@@ -198,15 +339,28 @@ void display_time() {
             if (char_pos < TIME_CHARS - 1) {
                 if (char_pos == 1 || char_pos == 4) {
                     // Two spaces before colon
-                    printf("  ");
+                    line_content[pos++] = ' ';
+                    line_content[pos++] = ' ';
                 } else {
                     // Single space between other characters
-                    printf(" ");
+                    line_content[pos++] = ' ';
                 }
             }
         }
-        printf("\n");
+        
+        line_content[pos++] = '\n';
+        line_content[pos] = '\0';
+        
+        // Write the entire line to buffer at once
+        write_to_buffer(hBackBuffer, line_content);
     }
+    
+    // Swap buffers to display the new frame instantly
+    swap_buffers();
+    
+    // Update previous time and first run flag
+    strcpy(previous_time_str, time_str);
+    first_run = 0;
 }
 
 int main() {
@@ -216,21 +370,34 @@ int main() {
         return 1;
     }
     
+    // Initialize double buffering
+    if (!init_double_buffer()) {
+        printf("Error: Could not initialize double buffering.\n");
+        return 1;
+    }
+    
     // Calculate required console size
     int max_height, max_width;
     get_max_dimensions(&max_height, &max_width);
     
-    // Calculate total width needed: 8 characters + 7 spaces (1 between most, 2 before colons)
-    // Actually: digit + space + digit + 2spaces + colon + 2spaces + digit + space + digit + 2spaces + colon + 2spaces + digit + space + digit
+    // Calculate total width needed using uniform character width
     int total_width = (max_width * 8) + 7 + 4; // 8 chars, 7 normal spaces, 4 extra spaces for colons
     
     // Make console wide enough to center the clock with some margin
     int console_width = total_width + 20; // Add 20 chars margin
     
-    // Resize console window
+    // Resize console window for both buffers
     resize_console(console_width, max_height);
     
-    printf("ASCII Clock - Press Ctrl+C to exit\n\n");
+    // Set screen buffer size for both buffers
+    COORD newSize = {console_width, max_height + 10};
+    SetConsoleScreenBufferSize(hScreen1, newSize);
+    SetConsoleScreenBufferSize(hScreen2, newSize);
+    
+    // Clear the initial screen and show startup message
+    clear_screen_buffer(hCurrentScreen);
+    set_cursor_position(hCurrentScreen, 0, 0);
+    write_to_buffer(hCurrentScreen, "ASCII Clock - Press Ctrl+C to exit\n\n");
     
     // Main loop - update every second
     while (1) {
